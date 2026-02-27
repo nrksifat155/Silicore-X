@@ -1,0 +1,7 @@
+streamlit
+qdrant-client
+openai
+cohere
+tenacity
+python-dotenv
+pandas
