@@ -110,7 +110,7 @@ def generate_answer(query, context=None):
             f"• If context is given, provide working Verilog snippets from it.\n"
             f"• If no context or low similarity, generate code from your own knowledge.\n"
             f"• Include minimal comments; cite sources if available.\n"
-            f"• If input code is correct, mention 'No errors detected.'\n"
+            f"• please donot use any code comment in the code'\n"
             f"• Keep responses concise, technical, and practical."
         )
         response = openai_client.chat.completions.create(
@@ -172,4 +172,5 @@ for turn in st.session_state.conversation:
     st.markdown("**User Input:**")
     st.code(turn["user"], language="verilog")
     st.markdown("**Silicore-X Feedback:**")
+
     st.markdown(turn["bot"])
