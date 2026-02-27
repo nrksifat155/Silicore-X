@@ -110,6 +110,7 @@ def generate_answer(query, context=None):
             f"• If context is given, provide working Verilog snippets from it.\n"
             f"• If no context or low similarity, generate code from your own knowledge.\n"
             f"• Include minimal comments; cite sources if available.\n"
+            f"• Mention A Upward Text Like,Here is your code and also mention the user topic name.\n"
             f"• please donot use any code comment in the code'\n"
             f"• Keep responses concise, technical, and practical."
         )
@@ -174,3 +175,4 @@ for turn in st.session_state.conversation:
     st.markdown("**Silicore-X Feedback:**")
 
     st.markdown(turn["bot"])
+
