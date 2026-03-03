@@ -1,286 +1,149 @@
 import streamlit as st
 from qdrant_client import QdrantClient
-from qdrant_client.http import models
-from openai import OpenAI
-from cohere import Client as CohereClient
+import google.generativeai as genai
 import logging
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential
 import os
 from dotenv import load_dotenv
 import numpy as np
-import re
+from google.api_core import exceptions
 
-
+# ─────────────────────────────────────────────────────────────
+# 1. CONFIGURATION (Loading from .env)
+# ─────────────────────────────────────────────────────────────
 
 load_dotenv()
 
-COLLECTION_NAME = "VerilogTest1"
-VECTOR_SIZE = 1536
-SIMILARITY_THRESHOLD = 0.78
-EMBEDDING_MODEL = "text-embedding-ada-002"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# .env থেকে API কি-গুলো লিস্ট আকারে নেওয়া হচ্ছে
+API_KEYS = [
+    os.getenv("GEMINI_API_KEY_1"),
+    os.getenv("GEMINI_API_KEY_2"),
+    os.getenv("GEMINI_API_KEY_3"),
+    os.getenv("GEMINI_API_KEY_4"),
+    os.getenv("GEMINI_API_KEY_5")
+]
+
+# ফিল্টার আউট None values (যদি ৫টির কম কী দেওয়া থাকে)
+API_KEYS = [k for k in API_KEYS if k]
+
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-QDRANT_CLUSTER_URL = os.getenv("QDRANT_URL")
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+QDRANT_URL     = os.getenv("QDRANT_URL")
 
-qdrant_client = QdrantClient(url=QDRANT_CLUSTER_URL, api_key=QDRANT_API_KEY)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-cohere_client = CohereClient(COHERE_API_KEY)
+GENERATIVE_MODEL = "gemini-3-flash-preview"
+EMBEDDING_MODEL  = "models/gemini-embedding-001" 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("chatbot.log")]
-)
-logger = logging.getLogger(__name__)
+qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
-
+# ─────────────────────────────────────────────────────────────
+# 2. ANALYSIS & ERROR CHECKING LOGIC
+# ─────────────────────────────────────────────────────────────
 
 def looks_like_verilog(text: str) -> bool:
     text = text.strip()
-    if len(text) < 20:
-        return False
-    lower = text.lower()
-    return any(kw in lower for kw in [
-        'module', 'endmodule', 'input', 'output', 'inout', 'wire', 'reg',
-        'always', 'assign', 'initial', 'posedge', 'negedge', '@(', 'begin', 'end'
-    ])
+    if len(text) < 20: return False
+    keywords = ['module', 'endmodule', 'input', 'output', 'wire', 'reg', 'always', 'assign', 'posedge', 'negedge']
+    return any(kw in text.lower() for kw in keywords)
 
-def simple_verilog_check(code: str) -> list[str]:
-    issues = []
+def perform_internal_check(code: str) -> dict:
+    report = {"Syntax": [], "Conceptual": [], "Mathematical/Logical": []}
+    if code.count('(') != code.count(')'): report["Syntax"].append("Unbalanced parentheses ()")
+    if code.count('[') != code.count(']'): report["Syntax"].append("Unbalanced brackets []")
+    if code.lower().count('begin') != code.lower().count('end'): report["Syntax"].append("Unbalanced begin/end")
+    if 'module' in code.lower() and 'endmodule' not in code.lower(): report["Syntax"].append("Missing endmodule")
+    
     lines = code.splitlines()
-
-    # Global balances
-    paren_count = code.count('(') - code.count(')')
-    if paren_count != 0:
-        issues.append(f"Unbalanced parentheses (difference: {paren_count:+d}) – check opening/closing ()")
-
-    bracket_count = code.count('[') - code.count(']')
-    if bracket_count != 0:
-        issues.append(f"Unbalanced brackets (difference: {bracket_count:+d}) – check bus widths like [n:0]")
-
-    begin_end_count = code.lower().count('begin') - code.lower().count('end')
-    if begin_end_count != 0:
-        issues.append(f"Unbalanced begin/end (difference: {begin_end_count:+d}) – ensure every begin has an end")
-
-    module_endmodule = 'module' in code.lower() and 'endmodule' not in code.lower()
-    if module_endmodule:
-        issues.append("Module declaration without endmodule – add 'endmodule;' at the end")
-
-    # Line-by-line checks
     for i, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith('//') or stripped.startswith('`'):
+        s = line.strip()
+        if 'always' in s.lower() and '@' not in s:
+            report["Conceptual"].append(f"Line {i}: always block missing sensitivity list")
+    return report
+
+# ─────────────────────────────────────────────────────────────
+# 3. CORE GENERATION LOGIC (With API Key Switching)
+# ─────────────────────────────────────────────────────────────
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+def get_embedding(text: str):
+    if not API_KEYS: return None
+    genai.configure(api_key=API_KEYS[0])
+    return genai.embed_content(model=EMBEDDING_MODEL, content=text, task_type="retrieval_query")["embedding"]
+
+def hybrid_search(query: str):
+    try:
+        emb = get_embedding(query)
+        hits = qdrant_client.query_points(collection_name="VerilogTest1", query=emb, limit=5, with_payload=True).points
+        return [{"code": h.payload.get("code"), "title": h.payload.get("title")} for h in hits]
+    except Exception: return []
+
+def generate_answer(messages, context, error_report, has_errors, is_verilog_code):
+    ctx_text = "\n".join([f"Source: {r['title']}\nCode: {r['code'][:800]}" for r in context])
+    
+    system_prompt = f"""
+You are a Verilog/VLSI Expert. Your responses must be sharp, concise, and technically accurate.
+
+### STRICT RULES:
+1. **If the code is correct ✅:** - Start exactly with: "The code is correct ✅"
+   - Do NOT provide a truth table or a rewritten code block.
+   - Provide only 3-4 brief, high-level recommendations for optimization or best practices in bullet points.
+
+2. **If the code is incorrect ❌:**
+   - Start exactly with: "The code is incorrect ❌"
+   - Identify the **Error Type** (e.g., Syntax, Conceptual, or Logical).
+   - Provide the **Corrected Code** in a single block starting with: **Here is the Verilog code for [topic]:**
+   - Do NOT provide a truth table or unnecessary explanations.
+
+3. **General Generation (No code provided by user):**
+   - Provide the Verilog code.
+   - Provide a Markdown **Truth Table** and mention the **Logic Gates** used.
+4. Answers must be concise and clear.
+
+Context from Database:
+{ctx_text}
+"""
+
+    for key in API_KEYS:
+        try:
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel(GENERATIVE_MODEL)
+            response = model.generate_content(f"{system_prompt}\n\nUser: {messages[-1]['content']}")
+            return response.text.strip()
+        except exceptions.ResourceExhausted:
             continue
+        except Exception:
+            continue
+    
+    return "All API key limits are exhausted. Please try again later."
 
-        # Suspicious always
-        if 'always' in stripped.lower() and '@' not in stripped:
-            issues.append(f"Line {i}: 'always' block without sensitivity list (@*) or (@(posedge clk)) – may cause simulation issues")
-
-        # Comment placement
-        if ';' in stripped and '//' in stripped and stripped.find('//') > stripped.find(';'):
-            issues.append(f"Line {i}: Comment after semicolon – consider moving comment to a separate line or before ;")
-
-        # Possible missing ;
-        if i < len(lines):
-            next_l = lines[i].strip()
-            if (stripped and not stripped.endswith(';') and not stripped.endswith('{')
-                and not stripped.endswith(')') and not stripped.startswith('end')
-                and next_l and not next_l.startswith('end') and not next_l.startswith('//')):
-                issues.append(f"Line {i}: Possible missing semicolon at end of statement")
-
-        # Common syntax: input/output without type
-        if any(kw in stripped.lower() for kw in ['input', 'output', 'inout']) and '[' in stripped and 'wire' not in stripped.lower() and 'reg' not in stripped.lower():
-            issues.append(f"Line {i}: Port declaration may need type (e.g., input wire [7:0] data)")
-
-    return issues[:10]  # Limit to avoid overwhelming
-
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=120), retry=retry_if_exception_type(Exception))
-def get_embedding(text):
-    resp = openai_client.embeddings.create(input=[text], model=EMBEDDING_MODEL)
-    return resp.data[0].embedding
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=120), retry=retry_if_exception_type(Exception))
-def search_qdrant(query_embedding, limit=200):
-    if query_embedding is None:
-        return []
-    try:
-        search_result = qdrant_client.query_points(
-            collection_name=COLLECTION_NAME,
-            query=query_embedding,
-            limit=limit,
-            with_payload=True
-        ).points
-        return [(hit.payload.get("code"), hit.payload.get("title"), hit.vector) for hit in search_result]
-    except Exception as e:
-        logger.error(f"Qdrant search error: {e}")
-        return []
-
-def cosine_similarity(a, b):
-    if a is None or b is None: return 0.0
-    a, b = np.array(a), np.array(b)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0: return 0.0
-    return np.dot(a, b) / (norm_a * norm_b)
-
-def rerank_results(query, chunks):
-    try:
-        docs = [c[0] for c in chunks if c[0]]
-        if not docs: return []
-        resp = cohere_client.rerank(query=query, documents=docs, top_n=min(30, len(docs)))
-        results = getattr(resp, "results", [])
-        if not results:
-            return [{"code": c[0], "title": c[1], "relevance_score": 0} for c in chunks[:50]]
-        idx_to_chunk = {i: c for i, c in enumerate(chunks)}
-        return [
-            {"code": idx_to_chunk[item.index][0],
-             "title": idx_to_chunk[item.index][1],
-             "relevance_score": item.relevance_score}
-            for item in results
-        ]
-    except Exception as e:
-        logger.error(f"Rerank error: {e}")
-        return [{"code": c[0], "title": c[1], "relevance_score": 0} for c in chunks[:50]]
-
-def generate_answer(messages_for_llm, context=None, detected_issues=None):
-    ctx_text = ""
-    if context:
-        ctx_text = "\n".join([
-            f"Source: {r['title']}\nCode: {r['code'][:1100]}{'...' if len(r['code'])>1100 else ''}"
-            for r in context[:10]
-        ])
-
-    issues_text = ""
-    if detected_issues:
-        issues_text = "\nDetected issues in user-provided code:\n" + "\n".join([f"- {issue}" for issue in detected_issues]) + "\nPlease address and correct these in your response."
-
-    system = f"""You are a Verilog / RTL / VLSI expert.
-• Generate VLSI/Verilog code for requests.
-• If user pastes code: analyze it, comment on errors/improvements, and provide corrected version if issues found.
-• Use context when helpful.
-• Show clean code with minimal comments. Start code blocks with: **Here is the Verilog code for [topic]:**
-• Be concise and technical.
-{issues_text}
-
-Context (if relevant):
-{ctx_text}"""
-
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "system", "content": system}] + messages_for_llm,
-            max_tokens=2200,
-            temperature=0.65
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"LLM error: {e}")
-        return "Error generating response."
-
-def hybrid_search(query):
-    emb = get_embedding(query)
-    if not emb: return []
-    results = search_qdrant(emb)
-    if not results: return []
-    sim = cosine_similarity(emb, results[0][2])
-    if sim >= SIMILARITY_THRESHOLD:
-        return rerank_results(query, results)
-    return []
-
-
+# ─────────────────────────────────────────────────────────────
+# 4. STREAMLIT UI
+# ─────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Silicore-X", page_icon="⚡", layout="wide")
+st.title("Silicore-X⚡")
 
-# Better looking chat bubbles
-st.markdown("""
-<style>
-    .stChatMessage {
-        padding: 1rem 1.2rem;
-        border-radius: 0
-        margin: 0.5rem 0;
-    }
-    .user .stChatMessage {
-        background: #0d47a1;
-        color: white;
-    }
-    .assistant .stChatMessage {
-        background: #1e1e2f;
-        color: #e0e0ff;
-    }
-    .stChatInput > div:first-child {
-        padding-bottom: 1.2rem;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-st.title("Silicore-X⚡Verilog🤖")
-st.markdown("""
-Ask your questions related to **Verilog, VLSI design**, **IC architecture**, **digital & analog circuits**, **logic synthesis**, **layout optimization**, and more ⚡💡
-
-The **Silicore-X agent**  will use **hybrid mode** ⚙️🚀
-""")
-# ── Session state ──
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Show conversation — oldest → newest (top to bottom)
 for msg in st.session_state.messages:
-    role = msg["role"]
-    content = msg["content"]
-    avatar = "👤" if role == "user" else "⚡"
+    with st.chat_message(msg["role"], avatar="👤" if msg["role"] == "user" else "⚡"):
+        st.markdown(msg["content"])
 
-    with st.chat_message(role, avatar=avatar):
-        if role == "user" and looks_like_verilog(content):
-            st.code(content, language="verilog")
-        else:
-            st.markdown(content)
-
-# ── Input box at bottom ──
-if user_input := st.chat_input("Ask Verilog related question or paste code"):
-    # Add & show user message
+if user_input := st.chat_input("Generate a circuit or paste code to analyze..."):
     st.session_state.messages.append({"role": "user", "content": user_input})
-
+    
     with st.chat_message("user", avatar="👤"):
-        if looks_like_verilog(user_input):
+        is_verilog_input = looks_like_verilog(user_input)
+        if is_verilog_input: 
             st.code(user_input, language="verilog")
-        else:
+        else: 
             st.markdown(user_input)
 
-    # Assistant response area
     with st.chat_message("assistant", avatar="⚡"):
-        with st.spinner("Thinking..."):
-            issues = []
-            if looks_like_verilog(user_input):
-                issues = simple_verilog_check(user_input)
-                if issues:
-                    st.warning("**Possible issues detecting in your code:**")
-                    for issue in issues:
-                        st.write("• " + issue)
-                    st.info("Generating updated code with corrections...")
-
+        status_label = "Analyzing..." if is_verilog_input else "Generating..."
+        with st.spinner(status_label):
+            error_report = perform_internal_check(user_input) if is_verilog_input else {"Syntax":[], "Conceptual":[], "Mathematical":[]}
+            has_errors = any(len(v) > 0 for v in error_report.values())
             context = hybrid_search(user_input)
-
-            # Last 10 full turns (≈20 messages)
-            recent = st.session_state.messages[-20:]
-            llm_msgs = [{"role": m["role"], "content": m["content"]} for m in recent]
-
-            answer = generate_answer(llm_msgs, context, detected_issues=issues)
-
+            answer = generate_answer(st.session_state.messages, context, error_report, has_errors, is_verilog_input)
             st.markdown(answer)
-
-    # Save assistant reply
-    st.session_state.messages.append({"role": "assistant", "content": answer})
-
-    # Force scroll to bottom
-    st.markdown(
-        """
-        <script>
-            const elem = window.parent.document.querySelector('.stApp > section > div');
-            if (elem) elem.scrollTop = elem.scrollHeight;
-        </script>
-        """,
-        unsafe_allow_html=True
-    )
+            st.session_state.messages.append({"role": "assistant", "content": answer})
