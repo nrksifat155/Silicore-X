@@ -1,7 +1,6 @@
 streamlit
 qdrant-client
-openai
-cohere
-tenacity
+google-generativeai
 python-dotenv
-pandas
+tenacity
+numpy
