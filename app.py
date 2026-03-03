@@ -120,6 +120,10 @@ Context from Database:
 
 st.set_page_config(page_title="Silicore-X", page_icon="⚡", layout="wide")
 st.title("Silicore-X⚡")
+st.markdown("""
+Ask your questions related to **Verilog, VLSI design**, **IC architecture**, **digital & analog circuits**, **logic synthesis**, **layout optimization**, and more ⚡💡
+
+""")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -147,3 +151,4 @@ if user_input := st.chat_input("Generate a circuit or paste code to analyze...")
             answer = generate_answer(st.session_state.messages, context, error_report, has_errors, is_verilog_input)
             st.markdown(answer)
             st.session_state.messages.append({"role": "assistant", "content": answer})
+
